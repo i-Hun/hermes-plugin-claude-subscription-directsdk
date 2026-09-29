@@ -6,6 +6,7 @@ import sys
 from test_directsdk import FAKE
 
 EXPECTED = {
+    'claude-sonnet-5-5[1m]': 1_000_000,
     'claude-sonnet-5[1m]': 1_000_000,
     'claude-haiku-4-5-20251001': 200_000,
     'claude-opus-5-5[1m]': 1_000_000,
