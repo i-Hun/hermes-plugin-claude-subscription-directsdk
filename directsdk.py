@@ -160,7 +160,16 @@ def normalize_input_schema(schema):
 
 def request_body(kwargs):
     allowed = {'model', 'messages', 'tools', 'stream', 'stream_options', 'max_tokens', 'max_completion_tokens',
-               'temperature', 'top_p', 'stop', 'extra_body', 'timeout', 'tool_choice', 'parallel_tool_calls', 'n', 'response_format'}
+               'temperature', 'top_p', 'stop', 'extra_body', 'timeout', 'tool_choice', 'parallel_tool_calls', 'n',
+               'response_format',
+               # Transport-level HTTP headers the engine attaches to the request (e.g.
+               # `x-initiator: user`, `X-OpenRouter-Cache`). They belong to the HTTP
+               # provider that was primary; this transport talks to a local process and
+               # cannot forward them, so they are ACCEPTED AND IGNORED, not rejected.
+               # 11.10.2026: rejecting them turned every fallback into a non-retryable
+               # ValueError — the backup path died instead of answering, which is worse
+               # than dropping a header that has no meaning here.
+               'extra_headers', 'extra_query'}
     unknown = set(kwargs) - allowed
     if unknown:
         raise ValueError('Unsupported request parameters: ' + ', '.join(sorted(unknown)))
@@ -371,10 +380,18 @@ class Client:
     HERMES_SKIP_TRANSPORT_WRAP = True
     HERMES_SKIP_ASYNC_WRAP = True
 
-    def __init__(self, command=None, args=None, env=None, timeout=180, **_):
+    def __init__(self, command=None, args=None, env=None, timeout=180, account=None, **_):
         # Hermes snapshots routing metadata from client-shaped objects; this is not a credential.
         self.api_key = 'external-process'
         self.base_url = 'process://claude-subscription-directsdk-experimental'
+        self.account = account
+        if account is not None:
+            try:
+                from .claude_accounts import account_env
+            except ImportError:
+                from claude_accounts import account_env
+            env = account_env(account, env, require_login=True)
+            self.base_url = 'process://claude-subscription-directsdk-ivan'
         self.env = dict(env) if env is not None else None
         source_env = self.env if self.env is not None else os.environ
         command = command or source_env.get('CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND') or 'claude'
@@ -467,6 +484,12 @@ class Client:
                 (root / 'tools.json').write_text(json.dumps(manifest), encoding='utf-8')
                 mcp = {'mcpServers': {'hermes': {'command': sys.executable, 'args': [str(Path(__file__).with_name('inert_mcp.py')), str(root / 'tools.json')]}}}
                 env = _with_windows_essentials(dict(self.env if self.env is not None else os.environ))
+                if self.account is not None:
+                    try:
+                        from .claude_accounts import account_env
+                    except ImportError:
+                        from claude_accounts import account_env
+                    env = account_env(self.account, env, require_login=True)
                 if self.env is None:
                     conflicts = [key for key in ('ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_FOUNDRY_API_KEY') if env.get(key)]
                     conflicts += [key for key in ('CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY') if env.get(key, '').lower() not in ('', '0', 'false', 'no', 'off')]
@@ -625,6 +648,15 @@ class Client:
                 chunk = self._chunk(kwargs['model'], {'content': None, 'tool_calls': [dict(tc, index=i) for i, tc in enumerate(calls)] or None, 'reasoning_details': [carrier]}, finish, normalized_usage)
                 chunk._response = response
                 yield chunk
+        except Exception:
+            if self.account is not None:
+                try:
+                    from .claude_accounts import AccountError
+                except ImportError:
+                    from claude_accounts import AccountError
+                # No raw native/upstream text or login hints pointing at the old account.
+                raise AccountError('Claude Ivan request failed; check the independent login or retry this account manually.') from None
+            raise
         finally:
             request.cancel()
             if request.admission is not None:
