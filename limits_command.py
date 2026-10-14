@@ -229,10 +229,12 @@ def safe_usage(account, fetch):
         if account not in helper.USAGE_ENABLED_ACCOUNTS:
             return LABELS[account] + "\nОтключён владельцем."
         text = fetch(account)
+        if not isinstance(text, str) or text == getattr(helper, "UNAVAILABLE", None):
+            text = fetch(account)   # one retry: a token mid-refresh answers on the second read
         if text == helper.LOGIN_EXPIRED:
             return LABELS[account] + "\n" + LOGIN_EXPIRED_TEXT.format(account=account)
-        if not isinstance(text, str):
-            return LABELS[account] + "\nНедоступно."
+        if not isinstance(text, str) or text == getattr(helper, "UNAVAILABLE", None):
+            return LABELS[account] + "\nНедоступно (повтори через минуту; причина — в errors.log)."
         try:
             out = sanitize_summary(account, text, prev=load_snapshot(account))
         except Exception:

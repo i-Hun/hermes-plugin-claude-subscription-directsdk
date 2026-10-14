@@ -21,6 +21,8 @@ from datetime import datetime
 
 ACCOUNT_DIRS = {"default": Path("/home/hun/.claude"), "ivan": Path("/home/hun/.claude-ivan")}
 UNAVAILABLE = "Usage unavailable."
+import logging as _logging
+_log = _logging.getLogger("claude_accounts.usage")
 LOGIN_EXPIRED = "Usage login expired."
 # Refresh this long before expiry so a request never races the 8 h token lifetime.
 _REFRESH_MARGIN_S = 300
@@ -251,13 +253,19 @@ def usage_summary(account):
         if status == 401:
             return LOGIN_EXPIRED
         if status != 200:
+            _log.warning("usage[%s]: HTTP %s", account, status)
             return UNAVAILABLE
         raw = response.read(_LIMIT + 1)
         if len(raw) > _LIMIT:
+            _log.warning("usage[%s]: body over limit", account)
             return UNAVAILABLE
-        return _format_usage(json.loads(raw))
-    except Exception:
-        # Deliberately no exception interpolation or logging at this trust boundary.
+        out = _format_usage(json.loads(raw))
+        if out == UNAVAILABLE:
+            _log.warning("usage[%s]: no known limit rows in payload", account)
+        return out
+    except Exception as exc:
+        # Class name only: no message text, body, token or identity crosses this boundary.
+        _log.warning("usage[%s]: %s", account, type(exc).__name__)
         return UNAVAILABLE
     finally:
         if connection is not None:
