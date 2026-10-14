@@ -1,4 +1,8 @@
-"""Local account isolation and read-only OAuth usage (no refresh or token fallback).
+"""Local account isolation and read-only OAuth usage (no token fallback).
+
+Usage never refreshes credentials itself: when the selected token is expired (or the
+API rejects it) it asks the isolated native Claude CLI to refresh under its own lock,
+then re-reads that account's file once.
 
 Paths are intentionally local deployment defaults. Importing this module performs no I/O.
 Login validation checks metadata only; it never reads, creates or chmods credentials.
@@ -9,12 +13,20 @@ import math
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
+import subprocess
 import time
 from datetime import datetime
 
 ACCOUNT_DIRS = {"default": Path("/home/hun/.claude"), "ivan": Path("/home/hun/.claude-ivan")}
 UNAVAILABLE = "Usage unavailable."
+LOGIN_EXPIRED = "Usage login expired."
+# Refresh this long before expiry so a request never races the 8 h token lifetime.
+_REFRESH_MARGIN_S = 300
+_REFRESH_TIMEOUT_S = 30
+# Cheapest native command observed to run the CLI's own OAuth refresh (no model request).
+_REFRESH_ARGV = ("mcp", "list")
 # Owner shutdown policy: restoring a credential file must not re-enable usage.
 USAGE_ENABLED_ACCOUNTS = frozenset({"ivan"})
 LOGIN_ERROR = "Independent Claude login unavailable; check account login and directory/file permissions (700/600)."
@@ -26,7 +38,12 @@ _AUTH_KEYS = {"API_KEY_HELPER", "CREDENTIALS_FILE", "GOOGLE_APPLICATION_CREDENTI
 _LIMIT = 128 * 1024
 _ROWS = (("five_hour", "Session"), ("seven_day", "Weekly"),
          ("seven_day_opus", "Weekly Opus"), ("seven_day_sonnet", "Weekly Sonnet"))
+_SEVERITY = re.compile(r"[a-z_]{1,20}")
 _RESET = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})\Z")
+
+
+class _TokenExpired(Exception):
+    """Selected token is (nearly) expired; only the native CLI may refresh it."""
 
 
 class AccountError(RuntimeError):
@@ -100,9 +117,62 @@ def _access_token(account):
     token, expires = oauth["accessToken"], oauth["expiresAt"]
     if not isinstance(token, str) or not token or not token.isascii() or any(c.isspace() or ord(c) < 33 or ord(c) == 127 for c in token):
         raise ValueError()
-    if type(expires) not in (int, float) or not math.isfinite(expires) or expires <= time.time() * 1000:
+    if type(expires) not in (int, float) or not math.isfinite(expires):
         raise ValueError()
+    if expires <= (time.time() + _REFRESH_MARGIN_S) * 1000:
+        raise _TokenExpired()
     return token
+
+
+def _native_refresh(account):
+    """Let the isolated native CLI refresh its own credentials under its own lock.
+
+    Plugin code never reads, sends or writes the refresh token. Output is discarded;
+    the only signal used is whether the credentials file afterwards holds a fresh token.
+    """
+    env = account_env(account, require_login=True)
+    exe = shutil.which("claude", path=env.get("PATH") or os.defpath)
+    if not exe:
+        return False
+    if not os.path.isabs(exe):
+        return False
+    try:
+        child = subprocess.Popen([exe, *_REFRESH_ARGV], env=env, cwd=str(_directory(account)),
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError:
+        return False
+    ok = True
+    try:
+        child.wait(timeout=_REFRESH_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        ok = False
+    # Always reap the whole session: `mcp list` may leave MCP-server grandchildren behind.
+    try:
+        os.killpg(child.pid, 9)
+    except OSError:
+        pass
+    try:
+        child.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        return False
+    return ok
+
+
+def _fresh_token(account, force=False):
+    """Token for this account only; one native refresh when expired or forced."""
+    if not force:
+        try:
+            return _access_token(account)
+        except _TokenExpired:
+            pass
+    if not _native_refresh(account):
+        raise _TokenExpired()
+    try:
+        return _access_token(account)
+    except (OSError, ValueError, KeyError, TypeError, AccountError):
+        # A failed native refresh blanks the token: that is an expired login, not corruption.
+        raise _TokenExpired() from None
 
 
 def _format_usage(payload):
@@ -121,7 +191,8 @@ def _format_usage(payload):
             name = model.get('display_name') if isinstance(model, dict) else None
             label = {'Opus': 'Weekly Opus', 'Sonnet': 'Weekly Sonnet', 'Fable': 'Weekly Fable'}.get(name)
         if label:
-            rows.append((label, {'utilization': item.get('percent'), 'resets_at': item.get('resets_at')}))
+            rows.append((label, {'utilization': item.get('percent'), 'resets_at': item.get('resets_at'),
+                                 'severity': item.get('severity')}))
     seen = set()
     for label, row in reversed(rows):
         if label in seen:
@@ -137,13 +208,18 @@ def _format_usage(payload):
             datetime.fromisoformat(reset.replace("Z", "+00:00"))
         except ValueError:
             continue
-        lines.append(f"{label}: {value:g}% | reset {reset}")
+        severity = row.get("severity")
+        tail = f" | severity {severity}" if isinstance(severity, str) and _SEVERITY.fullmatch(severity) else ""
+        lines.append(f"{label}: {value:g}% | reset {reset}{tail}")
         seen.add(label)
     return "\n".join(reversed(lines)) or UNAVAILABLE
 
 
 def usage_summary(account):
-    """Fetch only this account's usage. No redirects, ambient auth, retries or refresh.
+    """Fetch only this account's usage. No redirects, ambient auth or plugin-side refresh.
+
+    Expired token or HTTP 401: one native CLI refresh, then one retry; still failing
+    returns LOGIN_EXPIRED (re-login needed) instead of the generic UNAVAILABLE.
 
     HTTPSConnection verifies TLS and does not follow redirects or inherit proxy settings.
     All failures are fixed text; raw bodies, credentials and identities are never logged.
@@ -152,13 +228,29 @@ def usage_summary(account):
     try:
         if account not in USAGE_ENABLED_ACCOUNTS:
             return UNAVAILABLE
-        token = _access_token(account)
-        connection = http.client.HTTPSConnection("api.anthropic.com", timeout=15)
-        connection.request("GET", "/api/oauth/usage", headers={
-            "Authorization": "Bearer " + token,
-            "anthropic-beta": "oauth-2025-04-20", "Accept": "application/json"})
-        response = connection.getresponse()
-        if response.status != 200:
+        try:
+            token = _fresh_token(account)
+        except _TokenExpired:
+            return LOGIN_EXPIRED
+        for attempt in (0, 1):
+            connection = http.client.HTTPSConnection("api.anthropic.com", timeout=15)
+            connection.request("GET", "/api/oauth/usage", headers={
+                "Authorization": "Bearer " + token,
+                "anthropic-beta": "oauth-2025-04-20", "Accept": "application/json"})
+            response = connection.getresponse()
+            status = response.status
+            if status == 401 and attempt == 0:
+                connection.close()
+                connection = None
+                try:
+                    token = _fresh_token(account, force=True)
+                except _TokenExpired:
+                    return LOGIN_EXPIRED
+                continue
+            break
+        if status == 401:
+            return LOGIN_EXPIRED
+        if status != 200:
             return UNAVAILABLE
         raw = response.read(_LIMIT + 1)
         if len(raw) > _LIMIT:

@@ -13,6 +13,14 @@ OLD, IVAN = limits.PROVIDERS
 ROW = "Session: 12% | reset 2026-10-14T12:00:00Z"
 
 
+@pytest.fixture(autouse=True)
+def snapshot_path(tmp_path, monkeypatch):
+    # Never touch the real ~/.hermes/state snapshot from tests.
+    path = tmp_path / "limits-snapshot.json"
+    monkeypatch.setattr(limits, "SNAPSHOT", path)
+    return path
+
+
 def run(args="", **kwargs):
     defaults = dict(provider=IVAN, platform="telegram", user_id="123", owner_id="123",
                     send_dm=no_dm, fetch=lambda account: ROW)
@@ -107,11 +115,97 @@ def test_readable_format_fixed_clock():
         "🟢 Сессия (5 ч) — 4%  ▱▱▱▱▱▱▱▱▱▱\n     сброс сегодня в 18:20 · через 4 ч 20 мин\n"
         "🟡 Неделя — 55%  ▰▰▰▰▰▰▱▱▱▱\n     сброс завтра в 05:00 · через 15 ч 0 мин\n"
         "🔴 Неделя · Fable — 85.5%  ▰▰▰▰▰▰▰▰▰▱\n     сброс вт 20.10 в 05:00 · через 6 дн 15 ч\n\n"
-        "Время — CEST (UTC+02:00).")
+        "Снято 13.10 14:00 · время — CEST (UTC+02:00).")
 
 
 def test_no_valid_rows_unavailable():
     assert limits.sanitize_summary("ivan", "garbage\nSession: 5% | reset nope") == "Claude Ivan\nНедоступно."
+
+
+def test_severity_flag_and_unknown_lines_dropped():
+    raw = ROW + " | severity warning\nExtra: off | used 0.00 USD\nrm -rf"
+    out = run(fetch=lambda a: raw)
+    assert "⚠️ warning" in out and "Доп." not in out and "Extra" not in out
+    assert "rm -rf" not in out and "Снято " in out
+
+
+def test_delta_against_previous_limits(snapshot_path):
+    first = run(fetch=lambda a: "Session: 12% | reset 2026-10-14T12:00:00Z\nWeekly: 5% | reset 2026-10-20T03:00:00Z")
+    assert "п.п." not in first and "Δ к прошлому" not in first          # nothing to compare yet
+    saved = snapshot_path.read_text()
+    assert "Session" in saved and "@" not in saved and "Bearer" not in saved
+    second = run(fetch=lambda a: "Session: 19% | reset 2026-10-14T12:00:00Z\nWeekly: 5% | reset 2026-10-20T03:00:00Z")
+    assert "19%  ▰▰▱▱▱▱▱▱▱▱ · +7 п.п." in second
+    assert "5%  ▱▱▱▱▱▱▱▱▱▱ · =" in second and "Δ к прошлому /limits" in second
+
+
+def test_rolled_window_is_new_not_negative(snapshot_path):
+    run(fetch=lambda a: "Session: 80% | reset 2026-10-14T12:00:00Z")
+    out = run(fetch=lambda a: "Session: 3% | reset 2026-10-14T17:00:00Z")
+    assert "· новое окно" in out and "-77" not in out
+
+
+def test_reset_jitter_is_same_window(snapshot_path):
+    run(fetch=lambda a: "Session: 13% | reset 2026-10-14T08:59:59.912000+00:00")
+    out = run(fetch=lambda a: "Session: 13% | reset 2026-10-14T09:00:00.128000+00:00")
+    assert "· =" in out and "новое окно" not in out
+
+
+def test_corrupt_snapshot_never_breaks_reply(snapshot_path):
+    snapshot_path.write_text("{not json")
+    out = run(fetch=lambda a: ROW)
+    assert out.startswith("Claude Ivan — лимиты подписки") and "п.п." not in out
+    assert "Session" in snapshot_path.read_text()                          # healed on next save
+
+
+@pytest.mark.parametrize("bad", [
+    {"Session": {"x": 1}}, {"Session": ["x", "2026-10-14T12:00:00+00:00"]}, {"Session": [5]},
+    {"Session": [True, "2026-10-14T12:00:00+00:00"]}, {"Session": [5, "not-a-date"]},
+    {"Session": [5, "2026-10-14T12:00:00"]}, {"Session": [500, "2026-10-14T12:00:00+00:00"]}])
+@pytest.mark.parametrize("taken", [1e20, float("nan"), "x", True, None])
+def test_malformed_snapshot_costs_only_delta_and_heals(snapshot_path, bad, taken):
+    import json
+    snapshot_path.write_text(json.dumps({"ivan": {"taken": taken, "windows": bad}}).replace("NaN", "NaN"))
+    out = run(fetch=lambda a: ROW)
+    assert out.startswith("Claude Ivan — лимиты подписки") and "Недоступно" not in out
+    assert "п.п." not in out
+    healed = json.loads(snapshot_path.read_text())["ivan"]
+    assert healed["windows"]["Session"][0] == 12.0 and healed["taken"] < 4102444800
+
+
+def test_half_point_delta_never_shows_plus_zero(snapshot_path):
+    run(fetch=lambda a: "Session: 12% | reset 2026-10-14T12:00:00Z")
+    out = run(fetch=lambda a: "Session: 12.5% | reset 2026-10-14T12:00:00Z")
+    assert "+0 п.п." not in out and "+1 п.п." in out
+
+
+def test_concurrent_saves_keep_valid_json_and_both_accounts(snapshot_path, monkeypatch):
+    import json
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+    real_dumps = limits.json.dumps
+    def slow_dumps(*a, **k):        # widen the read-modify-write window so a missing lock loses updates
+        _time.sleep(0.005)
+        return real_dumps(*a, **k)
+    monkeypatch.setattr(limits.json, "dumps", slow_dumps)
+    # 32 distinct keys written concurrently: without the lock read-modify-write loses some.
+    with ThreadPoolExecutor(8) as pool:
+        list(pool.map(lambda i: limits.save_snapshot(f"acct{i}", ROW, path=snapshot_path), range(32)))
+    data = json.loads(snapshot_path.read_text())
+    assert set(data) == {f"acct{i}" for i in range(32)}
+    assert not [p for p in snapshot_path.parent.iterdir() if p.name.startswith(".limits-snapshot.json.")]
+
+
+def test_unavailable_does_not_overwrite_snapshot(snapshot_path):
+    run(fetch=lambda a: ROW)
+    before = snapshot_path.read_text()
+    run(fetch=lambda a: "garbage")
+    assert snapshot_path.read_text() == before
+
+
+def test_login_expired_names_relogin():
+    text = asyncio.run(asyncio.to_thread(limits.safe_usage, "ivan", lambda a: limits.account_helper().LOGIN_EXPIRED))
+    assert text == "Claude Ivan\nВход истёк и сам не обновился — нужен /claude-login ivan."
 
 
 def test_fetch_error_sanitized():

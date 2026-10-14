@@ -23,7 +23,21 @@ def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(accounts, "ACCOUNT_DIRS", paths)
     monkeypatch.setattr(accounts.time, "time", lambda: 1000)
     monkeypatch.setattr(accounts.http.client, "HTTPSConnection", Mock(side_effect=AssertionError("unexpected HTTP")))
+    # Never spawn the real native CLI from tests; refresh tests install their own fake.
+    monkeypatch.setattr(accounts.shutil, "which", lambda name, path=None: "/fake/bin/claude")
+    monkeypatch.setattr(accounts.subprocess, "Popen", Mock(side_effect=AssertionError("unexpected CLI spawn")))
     return paths
+
+
+def native(monkeypatch, paths, write=None):
+    """Fake native refresh: optionally rewrite credentials like the real CLI would."""
+    def popen(argv, **kwargs):
+        if write is not None:
+            credentials(paths, **write)
+        return Mock(pid=4242, wait=Mock(return_value=0))
+    spawn = Mock(side_effect=popen)
+    monkeypatch.setattr(accounts.subprocess, "Popen", spawn)
+    return spawn
 
 
 def credentials(paths, account="ivan", **overrides):
@@ -157,17 +171,118 @@ def test_missing_selected_credentials_never_fallback(isolated, monkeypatch, acco
     accounts.http.client.HTTPSConnection.assert_not_called()
 
 
-@pytest.mark.parametrize("overrides", [{"expiresAt": 1000000}, {"expiresAt": 0}, {"expiresAt": "private"},
-    {"expiresAt": float("nan")}, {"accessToken": ""}, {"accessToken": "secret\r\ninjection"}])
-def test_expired_or_bad_credentials_no_http_or_refresh(isolated, overrides):
+@pytest.mark.parametrize("overrides", [{"expiresAt": "private"}, {"expiresAt": float("nan")},
+    {"accessToken": ""}, {"accessToken": "secret\r\ninjection"}])
+def test_bad_credentials_no_http_or_refresh(isolated, overrides):
     path = credentials(isolated, **overrides)
     before = path.read_bytes()
     assert accounts.usage_summary("ivan") == accounts.UNAVAILABLE
     assert path.read_bytes() == before
     accounts.http.client.HTTPSConnection.assert_not_called()
+    accounts.subprocess.Popen.assert_not_called()
 
 
-@pytest.mark.parametrize("status", [301, 302, 303, 307, 308, 401, 403, 429, 500])
+# time() is 1000 s; margin 300 s -> anything below 1_300_000 ms counts as expired.
+@pytest.mark.parametrize("expires", [0, 1000000, 1299999])
+def test_expired_refresh_failure_is_login_expired(isolated, monkeypatch, expires):
+    path = credentials(isolated, expiresAt=expires)
+    before = path.read_bytes()
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "ambient-secret")
+    spawn = native(monkeypatch, isolated)          # CLI runs but writes nothing new
+    assert accounts.usage_summary("ivan") == accounts.LOGIN_EXPIRED
+    assert path.read_bytes() == before             # plugin itself never writes credentials
+    accounts.http.client.HTTPSConnection.assert_not_called()
+    spawn.assert_called_once()
+    argv, kwargs = spawn.call_args.args[0], spawn.call_args.kwargs
+    assert argv == ["/fake/bin/claude", "mcp", "list"]
+    assert kwargs["env"]["CLAUDE_CONFIG_DIR"] == str(isolated["ivan"])
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in kwargs["env"]
+    assert kwargs["stdin"] is accounts.subprocess.DEVNULL and kwargs["start_new_session"] is True
+    assert "shell" not in kwargs
+
+
+def test_expired_refreshed_by_native_cli_then_fetched(isolated, monkeypatch):
+    credentials(isolated, expiresAt=1000000)
+    spawn = native(monkeypatch, isolated, write={"accessToken": "ivan-new-token", "expiresAt": 9000000})
+    constructor, connection, _ = http(monkeypatch)
+    assert accounts.usage_summary("ivan").startswith("Session: 12%")
+    spawn.assert_called_once()
+    constructor.assert_called_once()
+    assert connection.request.call_args.kwargs["headers"]["Authorization"] == "Bearer ivan-new-token"
+
+
+def test_fresh_token_never_spawns_cli(isolated, monkeypatch):
+    credentials(isolated)
+    http(monkeypatch)
+    assert accounts.usage_summary("ivan").startswith("Session: 12%")
+    accounts.subprocess.Popen.assert_not_called()
+
+
+def test_missing_cli_is_login_expired(isolated, monkeypatch):
+    credentials(isolated, expiresAt=0)
+    monkeypatch.setattr(accounts.shutil, "which", lambda name, path=None: None)
+    assert accounts.usage_summary("ivan") == accounts.LOGIN_EXPIRED
+    accounts.subprocess.Popen.assert_not_called()
+
+
+def test_cli_timeout_kills_process_group(isolated, monkeypatch):
+    credentials(isolated, expiresAt=0)
+    child = Mock(pid=4242)
+    child.wait.side_effect = [accounts.subprocess.TimeoutExpired("claude", 30), 0]
+    monkeypatch.setattr(accounts.subprocess, "Popen", Mock(return_value=child))
+    killpg = Mock()
+    monkeypatch.setattr(accounts.os, "killpg", killpg)
+    assert accounts.usage_summary("ivan") == accounts.LOGIN_EXPIRED
+    killpg.assert_called_once_with(4242, 9)
+
+
+def test_relative_cli_path_refused(isolated, monkeypatch):
+    credentials(isolated, expiresAt=0)
+    monkeypatch.setattr(accounts.shutil, "which", lambda name, path=None: "bin/claude")
+    assert accounts.usage_summary("ivan") == accounts.LOGIN_EXPIRED
+    accounts.subprocess.Popen.assert_not_called()
+
+
+def test_401_refreshes_once_then_retries_with_new_token(isolated, monkeypatch):
+    credentials(isolated)
+    spawn = native(monkeypatch, isolated, write={"accessToken": "ivan-new-token", "expiresAt": 9000000})
+    constructor, connection, response = http(monkeypatch)
+    statuses = iter([401, 200])
+    type(response).status = property(lambda self: next(statuses))
+    assert accounts.usage_summary("ivan").startswith("Session: 12%")
+    spawn.assert_called_once()
+    assert constructor.call_count == 2
+    assert connection.request.call_args_list[-1].kwargs["headers"]["Authorization"] == "Bearer ivan-new-token"
+
+
+def test_refresh_that_blanks_token_is_login_expired(isolated, monkeypatch):
+    # Real CLI with a revoked refresh token rewrites the file with an empty accessToken.
+    credentials(isolated, expiresAt=0)
+    native(monkeypatch, isolated, write={"accessToken": "", "expiresAt": 0})
+    assert accounts.usage_summary("ivan") == accounts.LOGIN_EXPIRED
+
+
+def test_severity_allowlisted_spend_dropped(isolated, monkeypatch):
+    credentials(isolated)
+    http(monkeypatch, {"limits": [{"kind": "session", "percent": 91, "resets_at": RESET, "severity": "warning"},
+                                  {"kind": "weekly_all", "percent": 5, "resets_at": RESET, "severity": "Bearer x"}],
+                       "spend": {"enabled": True, "disclaimer": "private@example.test"}})
+    assert accounts.usage_summary("ivan") == (
+        f"Session: 91% | reset {RESET} | severity warning\nWeekly: 5% | reset {RESET}")
+
+
+def test_401_twice_is_login_expired_without_body(isolated, monkeypatch):
+    credentials(isolated)
+    spawn = native(monkeypatch, isolated)
+    constructor, connection, response = http(monkeypatch, status=401)
+    response.read.return_value = b"raw fake-token private@example.test"
+    assert accounts.usage_summary("ivan") == accounts.LOGIN_EXPIRED
+    spawn.assert_called_once()                     # exactly one refresh, no loop
+    assert constructor.call_count == 2
+    response.read.assert_not_called()
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308, 403, 429, 500])
 def test_http_errors_no_redirect_or_body_read(isolated, monkeypatch, status, capsys, caplog):
     credentials(isolated)
     _, connection, response = http(monkeypatch, status=status)

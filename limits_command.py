@@ -9,8 +9,13 @@ An allowlist, username, home channel or group administrator is NOT an owner.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import importlib.util
+import json
+import math
+import os
 import re
+import tempfile
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -23,8 +28,14 @@ LABELS = {"default": "Claude default", "ivan": "Claude Ivan"}
 WINDOWS = ("Session", "Weekly", "Weekly Opus", "Weekly Sonnet", "Weekly Fable", "Monthly")
 UNAVAILABLE = "Лимиты недоступны для текущего контекста провайдера."
 DENIED = "Общий отчёт доступен только явно настроенному владельцу через Telegram DM."
+LOGIN_EXPIRED_TEXT = "Вход истёк и сам не обновился — нужен /claude-login {account}."
 DM_FAILED = "Не удалось доставить личное сообщение. Общий отчёт здесь не публикуется."
 DEFAULT_HOME = Path("/home/hun/.hermes")
+# Last /limits snapshot per account: window -> [pct, reset]. Numbers only, no API text.
+SNAPSHOT = DEFAULT_HOME / "state" / "limits-snapshot.json"
+# API reset stamps jitter by fractions of a second (10:59:59.9 vs 11:00:00.1); a real
+# roll-over moves the reset by hours. Anything within this tolerance is the same window.
+_ROLL_TOLERANCE_S = 600
 
 
 WINDOW_TITLES = {
@@ -61,16 +72,30 @@ def _reset_text(reset, now):
     return f"сброс {day} в {local:%H:%M} · через {_left((reset - now).total_seconds())}"
 
 
-def sanitize_summary(account, text, now=None):
-    """Reconstruct from an allowlist; never echo error bodies, identities or API fields."""
-    now = now or datetime.now().astimezone()
-    lines = [LABELS[account]]
-    if not isinstance(text, str):
-        return lines[0] + "\nНедоступно."
+def _delta(window, pct, reset, prev):
+    """Change since the previous /limits; a rolled-over window is not a negative delta."""
+    old = (prev or {}).get("windows", {}).get(window)
+    if not old:
+        return ""
+    try:
+        old_reset = datetime.fromisoformat(old[1])
+        rolled = abs((reset - old_reset).total_seconds()) > _ROLL_TOLERANCE_S
+    except (TypeError, ValueError):
+        return ""
+    if rolled:
+        return " · новое окно"
+    raw = pct - old[0]
+    diff = int(math.copysign(math.floor(abs(raw) + 0.5), raw))  # half-up, not banker's
+    return " · =" if diff == 0 else f" · {diff:+d} п.п."
+
+
+def parse_rows(text):
+    """Allowlisted (window, pct, reset, severity) rows; anything else is dropped."""
     rows = []
     for line in text.splitlines()[:64]:
         match = re.fullmatch(
-            r"(" + "|".join(WINDOWS) + r"): (\d{1,3}(?:\.\d{1,2})?)% \| reset (\S+)", line
+            r"(" + "|".join(WINDOWS) + r"): (\d{1,3}(?:\.\d{1,2})?)% \| reset (\S+)"
+            r"(?: \| severity ([a-z_]{1,20}))?", line
         )
         if not match or not 0 <= float(match[2]) <= 100:
             continue
@@ -80,15 +105,101 @@ def sanitize_summary(account, text, now=None):
                 continue
         except ValueError:
             continue
-        pct = float(match[2])
-        rows.append(f"{_mark(pct)} {WINDOW_TITLES[match[1]]} — {pct:g}%  {_bar(pct)}\n"
-                    f"     {_reset_text(reset, now)}")
+        rows.append((match[1], float(match[2]), reset, match[4]))
+    return rows
+
+
+def sanitize_summary(account, text, now=None, prev=None):
+    """Reconstruct from an allowlist; never echo error bodies, identities or API fields."""
+    now = now or datetime.now().astimezone()
+    if not isinstance(text, str):
+        return LABELS[account] + "\nНедоступно."
+    rows = []
+    for window, pct, reset, severity in parse_rows(text):
+        flag = f"  ⚠️ {severity}" if severity and severity != "normal" else ""
+        try:
+            delta = _delta(window, pct, reset, prev)
+        except Exception:
+            delta = ""  # a bad snapshot costs only the delta, never the reply
+        rows.append(f"{_mark(pct)} {WINDOW_TITLES[window]} — {pct:g}%  {_bar(pct)}{flag}"
+                    f"{delta}\n     {_reset_text(reset, now)}")
     if not rows:
-        return lines[0] + "\nНедоступно."
+        return LABELS[account] + "\nНедоступно."
     tz = now.strftime("%Z") or "local"
     offset = now.strftime("%z")
+    since = ""
+    taken = (prev or {}).get("taken")
+    try:
+        if isinstance(taken, (int, float)) and not isinstance(taken, bool):
+            since = f" · Δ к прошлому /limits {datetime.fromtimestamp(taken, now.tzinfo):%d.%m %H:%M}"
+    except Exception:
+        since = ""
     return (f"{LABELS[account]} — лимиты подписки\n\n" + "\n".join(rows)
-            + f"\n\nВремя — {tz} (UTC{offset[:3]}:{offset[3:]}).")
+            + f"\n\nСнято {now:%d.%m %H:%M}{since} · время — {tz} (UTC{offset[:3]}:{offset[3:]}).")
+
+
+def _number(value, low, high):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and low <= value <= high)
+
+
+def load_snapshot(account, path=None):
+    """Shape-validated previous snapshot; anything malformed is dropped, never raised."""
+    try:
+        data = json.loads(Path(path or SNAPSHOT).read_text()).get(account)
+        if not isinstance(data, dict) or not isinstance(data.get("windows"), dict):
+            return None
+        windows = {}
+        for name, value in data["windows"].items():
+            if (name in WINDOWS and isinstance(value, list) and len(value) == 2
+                    and _number(value[0], 0, 100) and isinstance(value[1], str)):
+                try:
+                    if datetime.fromisoformat(value[1]).tzinfo is not None:
+                        windows[name] = value
+                except ValueError:
+                    continue
+        taken = data.get("taken")
+        return {"windows": windows,
+                "taken": taken if _number(taken, 0, 4102444800) else None}  # until 2100
+    except Exception:
+        return None
+
+
+def save_snapshot(account, text, path=None, now=None):
+    """Persist numbers only; failure to save never breaks the reply."""
+    path = Path(path or SNAPSHOT)
+    tmp = None
+    try:
+        rows = parse_rows(text)
+        if not rows:
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Serialize concurrent /limits (two chats, /limits all): read-modify-write under one lock.
+        lock_fd = os.open(path.with_name(path.name + ".lock"), os.O_CREAT | os.O_WRONLY, 0o600)
+        with os.fdopen(lock_fd, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                data = json.loads(path.read_text())
+                data = data if isinstance(data, dict) else {}
+            except Exception:
+                data = {}
+            data[account] = {"taken": (now or datetime.now().astimezone()).timestamp(),
+                             "windows": {w: [p, r.isoformat()] for w, p, r, _ in rows}}
+            fd, tmp = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".")
+            with os.fdopen(fd, "w") as stream:
+                stream.write(json.dumps(data))
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(tmp, path)
+            tmp = None
+    except Exception:
+        pass
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def account_helper():
@@ -114,9 +225,20 @@ def usage_summary(account):
 
 def safe_usage(account, fetch):
     try:
-        if account not in account_helper().USAGE_ENABLED_ACCOUNTS:
+        helper = account_helper()
+        if account not in helper.USAGE_ENABLED_ACCOUNTS:
             return LABELS[account] + "\nОтключён владельцем."
-        return sanitize_summary(account, fetch(account))
+        text = fetch(account)
+        if text == helper.LOGIN_EXPIRED:
+            return LABELS[account] + "\n" + LOGIN_EXPIRED_TEXT.format(account=account)
+        if not isinstance(text, str):
+            return LABELS[account] + "\nНедоступно."
+        try:
+            out = sanitize_summary(account, text, prev=load_snapshot(account))
+        except Exception:
+            out = sanitize_summary(account, text)  # snapshot never costs the reply
+        save_snapshot(account, text)               # and a bad snapshot heals here
+        return out
     except Exception:
         return LABELS[account] + "\nНедоступно."
 

@@ -55,8 +55,10 @@ Default config already aliases `/limits` to the default-only `safe-account-limit
   `claude_accounts.USAGE_ENABLED_ACCOUNTS` enforces this before credentials/HTTP, independently
   of provider configuration and even if old credentials reappear. The summary goes only to that Telegram user's DM,
   without a group thread or reply anchor. Failure to DM returns only a fixed refusal.
-- Read-only usage does not refresh credentials or poll in the background. Expired credentials
-  report unavailable; the isolated native login/request owns refresh.
+- Usage never refreshes credentials itself and does not poll in the background. When the token is
+  expired (or within 5 min of expiry) or the API answers 401, it runs the isolated native CLI
+  (`claude mcp list` with that account's CLAUDE_CONFIG_DIR, no model request) so the CLI refreshes
+  under its own lock, then re-reads the file once. Still expired -> "login expired, /claude-login".
 - Output allowlist: account label, numeric percentage, validated timezone-aware reset timestamp.
   No raw API body, email, plan identity, token, or upstream exception.
 
